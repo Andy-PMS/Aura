@@ -290,8 +290,21 @@ func wireAGUIServer(ctx context.Context, chat *chatEnv, store *cron.Store, sched
 		mcpWrite = mw
 	}
 	skillsWrite := buildSkillsWriteProvider(chat.cfg, chat.pool, skillLoaders)
-	if mcpWrite != nil || skillsWrite != nil {
-		aguiServer.SetGovernanceWriteProviders(agui.GovernanceWriteProviders{MCP: mcpWrite, Skills: skillsWrite})
+	// The plugin board's backend is the chat's too: one implementation behind both surfaces.
+	var invalidateSkills func()
+	if skillLoaders != nil {
+		invalidateSkills = skillLoaders.invalidateAll
+	}
+	var pluginBoard agui.PluginsProvider
+	if backend := buildPluginBackend(chat.cfg, chat.pool, live, execPreparer(chat.cfg), chat.sandboxRouter, invalidateSkills); backend != nil {
+		pluginBoard = backend
+		// Bound before the server serves, so before any turn reads it.
+		if chat.toolHandles.Pack != nil {
+			chat.toolHandles.Pack.Backend = backend
+		}
+	}
+	if mcpWrite != nil || skillsWrite != nil || pluginBoard != nil {
+		aguiServer.SetGovernanceWriteProviders(agui.GovernanceWriteProviders{MCP: mcpWrite, Skills: skillsWrite, Plugins: pluginBoard})
 	}
 	return aguiServer, runRegistry
 }

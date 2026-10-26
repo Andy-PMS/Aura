@@ -35,7 +35,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/aura-media-index ./cmd/aura-media-i
 RUN CGO_ENABLED=0 go build -trimpath -o /out/aura-ingest-supervisor ./cmd/aura-ingest-supervisor
 
 # Pinned by digest so that Dependabot moves it weekly, as it does the other bases.
-FROM python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+FROM python:3.15-slim-bookworm@sha256:575f8bc12ec26542e0678bc6b60e385218248019d433157ec327264a78c3a853
 
 # The digest alone does not refresh the apt layer below: libexpat1 and libbrotli1 are not in this
 # base, and a cached RUN keeps the versions it installed. On 2026-10-24 aura-ingest:edge had
@@ -55,7 +55,10 @@ ARG APT_WEEK=""
 # ingest (docker/aura/Dockerfile)". This sidecar is a NEW container that never inherited
 # it, so every PDF card failed with "a PDF's text could not be extracted" -- measured
 # 2026-08-08 across the fixture set.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# apt-get upgrade takes the fixes of the packages the base itself ships, which install leaves
+# alone: on 2026-10-26 this image had the base's libssl3 deb12u1 while bookworm had deb12u2
+# (CVE-2026-84782, issue #189).
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
       libreoffice-writer libreoffice-calc libreoffice-impress \
       fonts-dejavu-core \
       poppler-utils \
@@ -64,8 +67,12 @@ ENV SAL_USE_VCLPLUGIN=svp \
     HOME=/tmp \
     PYTHONUNBUFFERED=1
 
+# pip leaves once it has installed the requirements: nothing in the service runs it, and its own
+# vendored msgpack 1.1.2, urllib3 2.7.0 and setuptools 70.3.0 were HIGH findings on 2026-10-26
+# (issue #189) that pip 26.2.2, the newest release, still ships.
 COPY docker/aura-ingest/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip uninstall -y pip
 
 COPY --from=filecard /out/aura-filecard /usr/local/bin/aura-filecard
 COPY --from=filecard /out/aura-media-index /usr/local/bin/aura-media-index

@@ -151,7 +151,10 @@ type Config struct {
 	// MCPEnvDir roots the prepared environments stdio MCP servers launch from (#211). An
 	// install materialises the server here once and stores an absolute path into it, so a
 	// mount runs a binary instead of re-resolving a package with egress it may not have.
-	MCPEnvDir           string // AURA_MCP_ENV_DIR — stdio MCP prepared-environment root
+	MCPEnvDir string // AURA_MCP_ENV_DIR — stdio MCP prepared-environment root
+	// PluginsDir keeps each installed plugin's tree and its install record, the only account
+	// of which skills and connectors the plugin brought (spec 2026-10-25-pack-install §4.3).
+	PluginsDir          string // AURA_PLUGINS_DIR — installed plugins' kept trees and records
 	SkillSnippetTTLDays int    // AURA_SKILL_SNIPPET_TTL_DAYS — TTL sweep archives snippets unused this long (D-16/D-34)
 
 	// Write-boundary injection blocklist (D-27/D-34). The NFKC-normalize-then-
@@ -303,11 +306,10 @@ type Config struct {
 	Share     ShareConfig
 	Retention RetentionConfig
 
-	// Amendment #88 fixed local working root. WorkspaceDir is the single WorkspaceRoot
-	// every host-direct tool (shell_exec, fs_read/write/edit/glob/grep, send_file) and
-	// the per-turn runner.Deps.Workspace hint resolve against — replacing the previous
-	// process-cwd fallback (fs_* had NO WorkspaceRoot at all) with one fixed root, same
-	// path in-container as the strict-profile sandbox box's /workspace (forward-compat).
+	// Amendment #88 fixed working root, replacing the process-cwd fallback. The per-turn
+	// runner.Deps.Workspace hint names it and `aura docs` resolves its paths against it. In
+	// the container it is /workspace, the same path the per-identity box mounts its own volume
+	// at, so the hint names the directory the agent's boxed tools actually work in.
 	WorkspaceDir string // AURA_WORKSPACE_DIR — fixed working root, default ~/.aura/workspace (code) / /workspace (in-container env)
 
 	// MUSRIsolation declares this deployment fit to host more than ONE identity: while it
@@ -468,6 +470,7 @@ func loadBase() *Config {
 		SkillExportDir:        envDefault("AURA_SKILL_EXPORT_DIR", defaultSkillExportDir()),
 		SkillsIdentityDir:     envDefault("AURA_SKILLS_IDENTITY_DIR", defaultSkillsIdentityDir()),
 		MCPEnvDir:             envDefault("AURA_MCP_ENV_DIR", defaultMCPEnvDir()),
+		PluginsDir:            envDefault("AURA_PLUGINS_DIR", defaultPluginsDir()),
 		AppsDir:               envDefault("AURA_APPS_DIR", "/usr/share/aura/apps"),
 		SkillSnippetTTLDays:   envutil.IntDefault("AURA_SKILL_SNIPPET_TTL_DAYS", 90),
 

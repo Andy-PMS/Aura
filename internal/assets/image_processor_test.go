@@ -63,10 +63,10 @@ func TestImageProcessorReadsObjectAndCallsVisionSidecar(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	result, err := NewImageProcessor(objects, multimodal.VisionConfig{
+	result, err := NewImageProcessor(objects, multimodal.NewVisionClient(multimodal.VisionConfig{
 		LocalBaseURL: srv.URL,
 		LocalModel:   "glm-ocr",
-	}).ProcessAsset(context.Background(), Asset{
+	})).ProcessAsset(context.Background(), Asset{
 		ID:           "asset-1",
 		Modality:     ModalityImage,
 		ObjectBucket: ref.Bucket,
@@ -115,10 +115,10 @@ func TestImageProcessorCapsRetrievalText(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	result, err := NewImageProcessor(objects, multimodal.VisionConfig{
+	result, err := NewImageProcessor(objects, multimodal.NewVisionClient(multimodal.VisionConfig{
 		LocalBaseURL: srv.URL,
 		LocalModel:   "glm-ocr",
-	}).ProcessAsset(context.Background(), Asset{
+	})).ProcessAsset(context.Background(), Asset{
 		ID: "asset-long", Modality: ModalityImage, ObjectBucket: ref.Bucket,
 		ObjectKey: ref.Key, FileName: "long.png", MIMEType: "image/png",
 	})
@@ -131,7 +131,7 @@ func TestImageProcessorCapsRetrievalText(t *testing.T) {
 }
 
 func TestDescribeImageForRetrievalRejectsMissingClient(t *testing.T) {
-	_, err := DescribeImageForRetrieval(context.Background(), nil, []byte("image"), "image/png")
+	_, _, err := DescribeImageForRetrieval(context.Background(), nil, []byte("image"), "image/png")
 	if err == nil || !strings.Contains(err.Error(), "vision client is not configured") {
 		t.Fatalf("missing vision client error = %v, want configuration error", err)
 	}

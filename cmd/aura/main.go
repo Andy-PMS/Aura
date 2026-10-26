@@ -149,8 +149,10 @@ func runMCPDispatch(args []string) {
 	runMCP(ctx, pool, args)
 }
 
+const topLevelUsage = "usage: aura {serve|shell|doctor|chat <sub>|config <sub>|identity <sub>|gateway grants <sub>|paused-states <sub>|task <sub>|retention <plan|apply>|skills <sub>|pack <list|show>|agent <sub>|swarm-demo|web <doctor|tool ...>|tools|mcp <sub>|memory <sub>|db <sub>|objectstore <sub>|docs <sub>|version}"
+
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aura {serve|shell|doctor|chat <sub>|config <sub>|identity <sub>|gateway grants <sub>|paused-states <sub>|task <sub>|retention <plan|apply>|skills <sub>|pack <list|show|install|trust>|agent <sub>|swarm-demo|web <doctor|tool ...>|tools|mcp <sub>|memory <sub>|db <sub>|objectstore <sub>|docs <sub>|version}")
+	fmt.Fprintln(os.Stderr, topLevelUsage)
 }
 
 // buildRegistry is the pool-free, box-free registry the manifest/fixture verbs use. The nil
@@ -184,8 +186,8 @@ func buildBaseRegistryWithHandles(
 ) (*tools.Registry, runtimeToolHandles) {
 	handles := runtimeToolHandles{
 		// The background registry carries the SAME sandboxRouter the synchronous tools do (37-09):
-		// under a strict profile shell_exec routes background jobs into the box via startBox; a nil
-		// router (pool-free manifest paths, dev/local_trusted) keeps every job host-direct.
+		// shell_exec starts background jobs in the box via startBox, and a nil router (the
+		// pool-free manifest paths) denies them like every other routed call.
 		BackgroundShells: tools.NewBackgroundShells(sandboxRouter),
 		BackgroundCalls:  tools.NewBackgroundCalls(),
 		ShellApprovals:   tools.NewShellApprovals(),
@@ -206,7 +208,7 @@ func buildBaseRegistryWithHandles(
 	// a live pool is available (serve/chat boot, ts!=nil) the write actions are wired to
 	// the durable, gated Writer (11-05); the pool-free manifest path (`aura tools`) gets
 	// a read-only tool whose write actions error loudly.
-	handles.SkillManage = registerSkillTools(reg, cfg, taskStorePool(ts))
+	handles.SkillManage, handles.Pack = registerSkillTools(reg, cfg, taskStorePool(ts))
 	webEngine := web.NewClient(cfg)
 	// web_fetch / web_search are DELIBERATELY NOT routed into the box (D-11): they stay host-side,
 	// already SSRF-guarded — passing sandboxRouter here would be a scope error.

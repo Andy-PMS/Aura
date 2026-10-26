@@ -82,6 +82,15 @@ func (r Ref) String() string {
 	return r.Source + "/" + r.Directory
 }
 
+// SourceMarker is what a plugin install writes into the Source field of every connector it
+// saves. The field is already persisted beside each managed server, so a removal finds a
+// plugin's connectors by filter, without a table of its own.
+//
+// The prefix is reserved. Aura's own sources are bare words ("manual", "custom") or the
+// `recipe:` catalog form, so `pack:` cannot collide with one, and a human reading the
+// registry can see where a server came from.
+func SourceMarker(ref Ref) string { return "pack:" + ref.String() }
+
 // Pack is one plugin, whole.
 type Pack struct {
 	Source      string
@@ -90,6 +99,8 @@ type Pack struct {
 	Version     string
 	Description string
 	Author      string
+	// Format names the manifest the pack was read from: FormatClaude or FormatAgentPlugins.
+	Format string
 
 	// Skills carries NAMES, not bodies. The installer materializes a skill from
 	// `source@name` and Aura's own loader parses its frontmatter; re-parsing it
@@ -97,13 +108,33 @@ type Pack struct {
 	Skills   []string
 	Servers  []Server
 	Commands []Command
+
+	// What the reader reported or left out, each with its reason, so the operator sees it
+	// before approving anything: a manifest field it ignored, a skill or connector it
+	// skipped, and why the whole MCP configuration is off.
+	Notes          []string
+	SkippedSkills  []Skipped
+	SkippedServers []Skipped
+	MCPDisabled    string
+}
+
+// The two plugin formats the reader understands.
+const (
+	FormatClaude       = "claude"
+	FormatAgentPlugins = "agent-plugins/1.0.0"
+)
+
+// Skipped is a component the reader left out, with the reason a person can act on.
+type Skipped struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // Ref reconstructs the reference that resolves to exactly this pack.
 func (p Pack) Ref() Ref { return Ref{Source: p.Source, Directory: p.Directory} }
 
-// SkillRefs renders each skill in the syntax the existing installer accepts, so
-// installing a pack's skills is a loop over this and nothing more.
+// SkillRefs renders each skill in the `owner/repo@skill` syntax the skill installer accepts,
+// as `aura pack show` prints it.
 func (p Pack) SkillRefs() []string {
 	refs := make([]string, 0, len(p.Skills))
 	for _, s := range p.Skills {
@@ -123,6 +154,10 @@ type Server struct {
 	Command string
 	Args    []string
 	Env     map[string]string
+	// Cwd and Headers are Agent Plugins fields, carried unexpanded: placeholder expansion
+	// belongs to staging, which knows where the plugin lands.
+	Cwd     string
+	Headers map[string]string
 
 	// OAuth reports whether the entry declared an `oauth` block. A connector
 	// that needs a browser round-trip cannot be brought up unattended, and the

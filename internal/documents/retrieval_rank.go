@@ -3,6 +3,7 @@ package documents
 import (
 	"math"
 	"path"
+	"slices"
 	"sort"
 
 	"github.com/chetto1983/aura/internal/arcadedb"
@@ -16,22 +17,29 @@ type rankedDocument struct {
 	// them, and any order re-derived in Go could only disagree with it.
 	order   int
 	ordinal int64
+	// laneOrder is the best rank the exact lane gave the document. It orders the carriers only
+	// the lane found, which no leg scored or ordered.
+	laneOrder int
+	// fromLegs says a leg returned the document. One only the exact lane found stays only as a
+	// carrier of every exact term: the lane returns what carries any of them.
+	fromLegs bool
+	carrier  bool
 }
 
-// rankCardsOnly is the degraded answer: cards with no passage leg behind them. Names are
-// not looked up because a card already carries the one it was ranked by.
-func rankCardsOnly(cards []RetrievalCard, identifiers []string, limit, topPassages int) []RetrievalDocument {
-	return rankDocuments(cards, nil, nil, identifiers, limit, topPassages, true)
+// rankCardsOnly is the degraded answer: cards with no passage leg behind them, so every one
+// requires opening. Names are not looked up because a card already carries the one it was
+// ranked by.
+func rankCardsOnly(cards []RetrievalCard, terms []arcadedb.ExactTerm, limit, topPassages int) []RetrievalDocument {
+	return rankDocuments(cards, nil, exactLane{terms: terms}, nil, limit, topPassages)
 }
 
 func rankDocuments(
 	cards []RetrievalCard,
 	passages []arcadedb.PassageCandidate,
+	exact exactLane,
 	names map[string]string,
-	identifiers []string,
 	limit int,
 	topPassages int,
-	forceOpen bool,
 ) []RetrievalDocument {
 	// Keyed by CONTENT, not by document id: the fusion already groups its own candidates by
 	// raw_sha256, but the card leg is a separate Postgres query that cannot, so without this
@@ -51,20 +59,31 @@ func rankDocuments(
 	// them can represent both. What that trades: a file whose only overlap with another is
 	// the passage that happened to match is hidden behind it, and is then reachable by a
 	// query that matches its own content instead.
-	sameText := textAliases(cards, passages)
+	sameText := textAliases(slices.Concat(cards, exact.cards), slices.Concat(passages, exact.passages))
 	// Passages first and their order wins: a document the engine ranked is better
 	// evidenced than one only a card mentions, so cards start after the last passage.
 	for rank, passage := range passages {
 		doc := ensureRankedDocumentFromCandidate(byContent, sameText, passage, names)
-		doc.order = min(doc.order, rank)
+		doc.order, doc.fromLegs = min(doc.order, rank), true
 		doc.ordinal = min(doc.ordinal, passage.Ordinal)
 		if score := passage.Score(); score != nil && *score > doc.document.Score {
 			doc.document.Score = *score
 		}
 		mergePassage(doc, passage, rank+1)
 	}
+	// The exact lane's passages come before every card, so a document only the lane found is
+	// named by its passage as any passage-led one is (neighbourRefs relies on it). Its evidence
+	// sets no score and no leg order: one phrase's BM25 is not the legs' scale, and a carrier ranks
+	// first by rankExactTermsFirst, not by a number. Its laneOrder only breaks the tie in which the
+	// legs leave what they never returned.
+	for rank, passage := range exact.passages {
+		doc := ensureRankedDocumentFromCandidate(byContent, sameText, passage, names)
+		doc.laneOrder = min(doc.laneOrder, rank)
+		mergePassage(doc, passage, rank+1)
+	}
 	for rank, card := range cards {
 		doc := ensureRankedDocumentFromCard(byContent, sameText, card)
+		doc.fromLegs = true
 		// Not len(passages)+rank any more. That offset was a precedence rule standing in for
 		// a comparison the two legs could not make: BM25 here, a reranked cosine there. It
 		// meant no card could outrank any passage however well it matched, and measured
@@ -80,30 +99,45 @@ func rankDocuments(
 			Leg: "card", Rank: rank + 1, Score: new(card.Rank),
 		})
 	}
+	for rank, card := range exact.cards {
+		doc := ensureRankedDocumentFromCard(byContent, sameText, card)
+		doc.laneOrder = min(doc.laneOrder, rank)
+		doc.document.Evidence = appendEvidence(doc.document.Evidence, RetrievalEvidence{
+			Leg: string(arcadedb.RetrievalLegExact), Rank: rank + 1, Score: new(card.Rank),
+		})
+	}
 
 	ranked := make([]*rankedDocument, 0, len(byContent))
 	for _, doc := range byContent {
-		doc.document.RequiresOpen = forceOpen || len(doc.passages) == 0
+		doc.document.RequiresOpen = len(doc.passages) == 0
 		doc.document.Passages = sortedPassages(doc.passages, topPassages)
-		ranked = append(ranked, doc)
+		doc.carrier = carriesExactTerms(doc.document, exact.terms)
+		if doc.fromLegs || doc.carrier {
+			ranked = append(ranked, doc)
+		}
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		// The score first, because both legs finally speak it. order stays as the tie-break:
 		// the engine already put each leg in its own order and a tie re-derived in Go could
-		// only disagree with it.
+		// only disagree with it. laneOrder then orders what only the exact lane found.
 		if ranked[i].document.Score != ranked[j].document.Score {
 			return ranked[i].document.Score > ranked[j].document.Score
 		}
 		if ranked[i].order != ranked[j].order {
 			return ranked[i].order < ranked[j].order
 		}
+		if ranked[i].laneOrder != ranked[j].laneOrder {
+			return ranked[i].laneOrder < ranked[j].laneOrder
+		}
 		if ranked[i].document.DocumentID != ranked[j].document.DocumentID {
 			return ranked[i].document.DocumentID < ranked[j].document.DocumentID
 		}
 		return ranked[i].ordinal < ranked[j].ordinal
 	})
-	rankIdentifiersFirst(ranked, identifiers)
-	reserveCardLane(ranked)
+	// The reserved place sits behind the carriers: a file the question names verbatim outranks
+	// one that only might answer it.
+	carriers := rankExactTermsFirst(ranked)
+	reserveCardLane(ranked[carriers:])
 	if len(ranked) > limit {
 		ranked = ranked[:limit]
 	}
@@ -112,37 +146,6 @@ func rankDocuments(
 		out[index] = ranked[index].document
 	}
 	return out
-}
-
-// rankIdentifiersFirst moves every document whose title, card or returned passages carry all
-// of the question's identifiers ahead of those that do not, keeping the score order within
-// each group. It runs before the limit, so such a document is never cut off by the ones that
-// outscore it.
-//
-// Similarity cannot establish an exact technical identity, which is memory recall's rule
-// (arcadedb identifiers.go), and the final vector.rerank orders by cosine alone. Measured
-// 2026-10-16 on the complex corpus: "che difetto riguardava il reclamo RC-2026-040" ranked
-// note_pagamenti.txt first and the quality report, the only file holding that number, third.
-// With the rule r@1 went 0.735 -> 0.794 and MRR 0.848 -> 0.882 over 34 questions, two golds up
-// and none down, and the office fixture did not move (prd.md, "Exact identifiers rank first").
-// What that does not show: the code sets, which were not run.
-func rankIdentifiersFirst(ranked []*rankedDocument, identifiers []string) {
-	if len(identifiers) == 0 {
-		return
-	}
-	sort.SliceStable(ranked, func(i, j int) bool {
-		return carriesIdentifiers(ranked[i].document, identifiers) &&
-			!carriesIdentifiers(ranked[j].document, identifiers)
-	})
-}
-
-func carriesIdentifiers(document RetrievalDocument, identifiers []string) bool {
-	texts := make([]string, 0, 2+len(document.Passages))
-	texts = append(texts, document.Title, document.Card)
-	for _, passage := range document.Passages {
-		texts = append(texts, passage.Text)
-	}
-	return arcadedb.IdentifiersMatch(identifiers, texts...)
 }
 
 // reserveCardLane keeps ONE place for a document that has no passages.
@@ -251,7 +254,7 @@ func newRankedDocument(documentID string) *rankedDocument {
 			Evidence:   []RetrievalEvidence{}, Passages: []RetrievalPassage{},
 		},
 		passages: make(map[string]*RetrievalPassage),
-		order:    math.MaxInt, ordinal: math.MaxInt64,
+		order:    math.MaxInt, ordinal: math.MaxInt64, laneOrder: math.MaxInt,
 	}
 }
 
@@ -359,8 +362,12 @@ func sortedPassages(passages map[string]*RetrievalPassage, limit int) []Retrieva
 	for _, passage := range passages {
 		out = append(out, *passage)
 	}
-	// Engine order is already the ranking, so ties break on position in the document.
+	// A passage that carries an exact term comes first, so the cut never drops what a carrier
+	// ranks first by (carriesExactTerms judges the passages returned); then the document's order.
 	sort.Slice(out, func(i, j int) bool {
+		if exactI, exactJ := hasExactEvidence(out[i]), hasExactEvidence(out[j]); exactI != exactJ {
+			return exactI
+		}
 		if out[i].Ordinal != out[j].Ordinal {
 			return out[i].Ordinal < out[j].Ordinal
 		}

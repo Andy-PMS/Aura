@@ -1,0 +1,205 @@
+package agui
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/chetto1983/aura/internal/packs"
+	"github.com/chetto1983/aura/internal/plugins"
+)
+
+// fakePlugins answers each call with the error a test sets, recording what reached it.
+type fakePlugins struct {
+	err error
+	// partial makes err stop a write after it began, with a report of what was done; otherwise
+	// err is a refusal and the report is empty.
+	partial    bool
+	installed  plugins.InstallRequest
+	removed    string
+	deleteData bool
+	upgraded   string
+}
+
+func (f *fakePlugins) List() ([]plugins.Record, error) {
+	return []plugins.Record{{Name: "broker-analysis", Phase: plugins.PhaseInstalled}}, f.err
+}
+
+func (f *fakePlugins) Review(_ context.Context, ref string) (plugins.Review, error) {
+	if f.err != nil {
+		return plugins.Review{}, f.err
+	}
+	return plugins.Review{
+		Ref:               ref,
+		Connectors:        []plugins.Connector{{Name: "broker-analysis", Placement: plugins.PlacementBox}},
+		SkippedConnectors: []packs.Skipped{{Name: "memory", Reason: "reserved by recipe:memory"}},
+	}, nil
+}
+
+func (f *fakePlugins) Install(_ context.Context, _ string, req plugins.InstallRequest) (plugins.Report, error) {
+	f.installed = req
+	if f.err != nil && !f.partial {
+		return plugins.Report{}, f.err
+	}
+	return plugins.Report{Review: plugins.Review{Name: "p"}, Skills: []plugins.Step{{Name: "s", Outcome: plugins.OutcomeOK}}}, f.err
+}
+
+func (f *fakePlugins) Remove(_ context.Context, _, name string, deleteData bool) (plugins.RemoveReport, error) {
+	f.removed, f.deleteData = name, deleteData
+	if f.err != nil && !f.partial {
+		return plugins.RemoveReport{}, f.err
+	}
+	return plugins.RemoveReport{Name: name, Skills: []plugins.Step{{Name: "s", Outcome: plugins.OutcomeOK}}, DataDeleted: deleteData}, f.err
+}
+
+func (f *fakePlugins) Upgrade(_ context.Context, _, name string) (plugins.UpgradeReport, error) {
+	f.upgraded = name
+	if f.err != nil && !f.partial {
+		return plugins.UpgradeReport{}, f.err
+	}
+	return plugins.UpgradeReport{
+		Name: name, FromVersion: "0.1.1", Version: "0.3.0", Applied: true,
+		Skills: []plugins.Step{{Name: "s", Outcome: plugins.OutcomeOK, Reason: "updated"}},
+	}, f.err
+}
+
+func pluginServer(p PluginsProvider) *Server {
+	s := NewServer(&scriptedRunner{}, nil, ServerConfig{})
+	s.SetGovernanceWriteProviders(GovernanceWriteProviders{Plugins: p})
+	return s
+}
+
+const commit40 = "0123456789abcdef0123456789abcdef01234567"
+
+func TestPluginRoutes(t *testing.T) {
+	t.Run("unwired", func(t *testing.T) {
+		s := NewServer(&scriptedRunner{}, nil, ServerConfig{})
+		for _, rt := range []writeRoute{
+			{http.MethodGet, "/api/governance/plugins", ""},
+			{http.MethodPost, "/api/governance/plugins/review", `{"ref":"o/r/p"}`},
+			{http.MethodPost, "/api/governance/plugins", `{"ref":"o/r/p","commit":"` + commit40 + `","digest":"d"}`},
+			{http.MethodPost, "/api/governance/plugins/p/upgrade", ""},
+			{http.MethodDelete, "/api/governance/plugins/p", ""},
+		} {
+			if rec := doGovWrite(t, s, rt.method, rt.target, rt.body, true); rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("%s %s = %d, want 503", rt.method, rt.target, rec.Code)
+			}
+		}
+	})
+	t.Run("a write with no principal", func(t *testing.T) {
+		s := pluginServer(&fakePlugins{})
+		if rec := doGovWrite(t, s, http.MethodDelete, "/api/governance/plugins/p", "", false); rec.Code != http.StatusUnauthorized {
+			t.Errorf("unauthenticated remove = %d, want 401", rec.Code)
+		}
+	})
+	t.Run("status codes", func(t *testing.T) {
+		for err, want := range map[error]int{
+			fmt.Errorf("%w: bad ref", plugins.ErrInvalidRequest): http.StatusBadRequest,
+			plugins.ErrDigestChanged:                             http.StatusConflict,
+			fmt.Errorf("%w: p", plugins.ErrAlreadyInstalled):     http.StatusConflict,
+			fmt.Errorf("%w: p", plugins.ErrNotInstalled):         http.StatusNotFound,
+			errors.New("fetch o/r: exit status 128"):             http.StatusBadGateway,
+		} {
+			s := pluginServer(&fakePlugins{err: err})
+			body := `{"ref":"o/r/p","commit":"` + commit40 + `","digest":"d"}`
+			if rec := doGovWrite(t, s, http.MethodPost, "/api/governance/plugins", body, true); rec.Code != want {
+				t.Errorf("install with %v = %d, want %d", err, rec.Code, want)
+			}
+		}
+	})
+	t.Run("a write that stopped part way answers what it did and why", func(t *testing.T) {
+		stop := errors.New("save the connectors of p: database is unreachable")
+		for _, rt := range []writeRoute{
+			{http.MethodPost, "/api/governance/plugins", `{"ref":"o/r/p","commit":"` + commit40 + `","digest":"d"}`},
+			{http.MethodPost, "/api/governance/plugins/p/upgrade", ""},
+			{http.MethodDelete, "/api/governance/plugins/p", ""},
+		} {
+			rec := doGovWrite(t, pluginServer(&fakePlugins{err: stop, partial: true}), rt.method, rt.target, rt.body, true)
+			var got struct {
+				Error  string
+				Report struct{ Skills []plugins.Step }
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusMultiStatus ||
+				got.Error != stop.Error() || len(got.Report.Skills) != 1 {
+				t.Errorf("%s %s = %d %s", rt.method, rt.target, rec.Code, rec.Body)
+			}
+		}
+	})
+	t.Run("a malformed body", func(t *testing.T) {
+		s := pluginServer(&fakePlugins{})
+		if rec := doGovWrite(t, s, http.MethodPost, "/api/governance/plugins/review", `{"ref":`, true); rec.Code != http.StatusBadRequest {
+			t.Errorf("malformed review = %d, want 400", rec.Code)
+		}
+	})
+	t.Run("the install reaches the backend with the approved request", func(t *testing.T) {
+		f := &fakePlugins{}
+		body := `{"ref":"o/r/p","commit":"` + commit40 + `","digest":"d"}`
+		if rec := doGovWrite(t, pluginServer(f), http.MethodPost, "/api/governance/plugins", body, true); rec.Code != http.StatusOK {
+			t.Fatalf("install = %d %s", rec.Code, rec.Body)
+		}
+		if f.installed != (plugins.InstallRequest{Ref: "o/r/p", Commit: commit40, Digest: "d"}) {
+			t.Errorf("installed %+v", f.installed)
+		}
+	})
+	t.Run("the upgrade reaches the backend and answers its report", func(t *testing.T) {
+		f := &fakePlugins{}
+		rec := doGovWrite(t, pluginServer(f), http.MethodPost, "/api/governance/plugins/p/upgrade", "", true)
+		var got plugins.UpgradeReport
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusOK || got.Version != "0.3.0" || !got.Applied {
+			t.Fatalf("upgrade = %d %s (%v)", rec.Code, rec.Body, err)
+		}
+		if f.upgraded != "p" {
+			t.Errorf("upgraded %q", f.upgraded)
+		}
+	})
+	t.Run("an upgrade of an unknown plugin is 404 and a rollback says why", func(t *testing.T) {
+		for err, want := range map[error]int{
+			fmt.Errorf("%w: p", plugins.ErrNotInstalled):                                       http.StatusNotFound,
+			fmt.Errorf("%w: p stays at 0.1.1: handshake failed", plugins.ErrUpgradeRolledBack): http.StatusBadGateway,
+		} {
+			rec := doGovWrite(t, pluginServer(&fakePlugins{err: err}), http.MethodPost, "/api/governance/plugins/p/upgrade", "", true)
+			var got struct{ Error string }
+			if jerr := json.Unmarshal(rec.Body.Bytes(), &got); jerr != nil || rec.Code != want || got.Error != err.Error() {
+				t.Errorf("upgrade with %v = %d %s, want %d and the reason", err, rec.Code, rec.Body, want)
+			}
+		}
+	})
+	t.Run("data=delete reaches the removal", func(t *testing.T) {
+		for target, want := range map[string]bool{
+			"/api/governance/plugins/p?data=delete": true,
+			"/api/governance/plugins/p":             false,
+		} {
+			f := &fakePlugins{}
+			if rec := doGovWrite(t, pluginServer(f), http.MethodDelete, target, "", true); rec.Code != http.StatusOK {
+				t.Fatalf("remove = %d", rec.Code)
+			}
+			if f.removed != "p" || f.deleteData != want {
+				t.Errorf("%s: removed %q deleteData %v", target, f.removed, f.deleteData)
+			}
+		}
+	})
+	t.Run("the review fields", func(t *testing.T) {
+		rec := doGovWrite(t, pluginServer(&fakePlugins{}), http.MethodPost, "/api/governance/plugins/review", `{"ref":"o/r/p"}`, true)
+		var got struct {
+			Connectors        []struct{ Placement string }
+			SkippedConnectors []struct{ Reason string } `json:"skipped_connectors"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode %s: %v", rec.Body, err)
+		}
+		if len(got.Connectors) != 1 || got.Connectors[0].Placement != "box" ||
+			len(got.SkippedConnectors) != 1 || got.SkippedConnectors[0].Reason != "reserved by recipe:memory" {
+			t.Errorf("review = %s", rec.Body)
+		}
+	})
+	t.Run("the list", func(t *testing.T) {
+		rec := doGovWrite(t, pluginServer(&fakePlugins{}), http.MethodGet, "/api/governance/plugins", "", true)
+		var got struct{ Plugins []plugins.Record }
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || len(got.Plugins) != 1 || got.Plugins[0].Name != "broker-analysis" {
+			t.Errorf("list = %d %s (%v)", rec.Code, rec.Body, err)
+		}
+	})
+}

@@ -140,8 +140,9 @@ type FactSearchResult struct {
 	Abstained     bool
 	Reason        string
 	// FloorsReason is ReasonUncalibratedFloors when a hybrid answer was admitted by floors
-	// never measured for its space (spec §9). Reason names why a read left the dense path;
-	// this names how far to trust one that did not.
+	// never measured for its space (spec §9). Reason names every way the read is less than
+	// whole, "+"-joined (JoinReasons): why it left the dense path, an exact lane that failed,
+	// and why it abstained; this names how far to trust a read that kept the dense path.
 	FloorsReason string
 }
 
@@ -184,6 +185,29 @@ func (c *Client) SearchFactsHybrid(
 	if asOf.IsZero() {
 		asOf = time.Now()
 	}
+	result, err := c.rankFactsHybrid(ctx, query, limit, asOf)
+	if err != nil {
+		return FactSearchResult{}, err
+	}
+	if facts, err := c.exactFactsFirst(ctx, query, result.Facts, limit, asOf); err != nil {
+		result.Reason = JoinReasons(result.Reason, reasonExactTermsFailed)
+	} else {
+		result.Facts = facts
+	}
+	// The lexical fallback's own reason stands for its abstention, as it always has; a hybrid
+	// read adds the abstention to an exact lane's failure rather than hiding behind it.
+	if len(result.Facts) == 0 {
+		result.Abstained = true
+		if result.RetrievalPath == retrievalPathHybrid || result.Reason == "" {
+			result.Reason = JoinReasons(result.Reason, reasonNoQualifiedCandidates)
+		}
+	}
+	return result, nil
+}
+
+// rankFactsHybrid is the fused read, or the lexical read it falls back to. Whether the search
+// abstains is decided by its caller, once the exact lane has run.
+func (c *Client) rankFactsHybrid(ctx context.Context, query string, limit int, asOf time.Time) (FactSearchResult, error) {
 	dense, reason := c.denseQueryVector(ctx, query)
 	if dense.vector == nil {
 		return c.searchFactsFallback(ctx, query, limit, asOf, reason)
@@ -192,6 +216,7 @@ func (c *Client) SearchFactsHybrid(
 	// Over-fetch each leg: fusion can only reorder what it is given, and a fact
 	// ranked 8th lexically and 2nd densely is exactly the one the fusion exists
 	// to promote.
+	limits := c.memoryLimits()
 	candidates := min(max(limit*4, 20), limits.HybridCandidates)
 	params := map[string]any{
 		"query":             escapeLucene(query),
@@ -207,12 +232,7 @@ func (c *Client) SearchFactsHybrid(
 		return c.searchFactsFallback(ctx, query, limit, asOf, reasonFusionFailed)
 	}
 	if len(ranked) == 0 {
-		return FactSearchResult{
-			RetrievalPath: retrievalPathHybrid,
-			Abstained:     true,
-			Reason:        reasonNoQualifiedCandidates,
-			FloorsReason:  floorsReason,
-		}, nil
+		return FactSearchResult{RetrievalPath: retrievalPathHybrid, FloorsReason: floorsReason}, nil
 	}
 	rids := make([]string, 0, len(ranked))
 	for _, row := range ranked {
@@ -259,12 +279,7 @@ func (c *Client) SearchFactsHybrid(
 			hits = append(hits, item.hit)
 		}
 	}
-	result := FactSearchResult{Facts: hits, RetrievalPath: retrievalPathHybrid, FloorsReason: floorsReason}
-	if len(hits) == 0 {
-		result.Abstained = true
-		result.Reason = reasonNoQualifiedCandidates
-	}
-	return result, nil
+	return FactSearchResult{Facts: hits, RetrievalPath: retrievalPathHybrid, FloorsReason: floorsReason}, nil
 }
 
 func (c *Client) searchFactsFallback(
@@ -278,12 +293,7 @@ func (c *Client) searchFactsFallback(
 	if err != nil {
 		return FactSearchResult{}, err
 	}
-	return FactSearchResult{
-		Facts:         hits,
-		RetrievalPath: retrievalPathLexical,
-		Abstained:     len(hits) == 0,
-		Reason:        reason,
-	}, nil
+	return FactSearchResult{Facts: hits, RetrievalPath: retrievalPathLexical, Reason: reason}, nil
 }
 
 // rankedFact keeps a hydrated fact next to its place in the fused ranking.

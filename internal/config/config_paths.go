@@ -72,3 +72,13 @@ func defaultSkillExportDir() string { return filepath.Join(defaultSkillsDir(), "
 // from here — and it deliberately avoids the three cache mounts, since a named volume seeded
 // once is exactly what made a build-time warm-up invisible to every later image.
 func defaultMCPEnvDir() string { return filepath.Join(auraHomeDir(), "mcp-envs") }
+
+// defaultPluginsDir is the AURA_PLUGINS_DIR code default: ~/.aura/plugins. Compose pins the
+// container's to /var/lib/aura/plugins on the durable aura-home volume, as it does
+// AURA_MCP_ENV_DIR.
+func defaultPluginsDir() string { return filepath.Join(auraHomeDir(), "plugins") }
+
+// ChatGPTPlanRoot is the directory chatgptplan keeps its store beneath: beside the skills
+// root, aura-home under compose. The daemon and the media indexer must agree on it, so
+// neither computes it.
+func (c *Config) ChatGPTPlanRoot() string { return filepath.Dir(c.SkillsDir) }

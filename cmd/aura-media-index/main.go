@@ -52,13 +52,16 @@ type mediaRuntime struct {
 // primaryAcceptsImages is passed in, not probed here: the capability is resolved once at
 // the edge so construction stays pure and the route needs no network to be decided. creds
 // gives the cloud speech leg the services key, and the primary vision route the same key only
-// when that route is OpenRouter.
+// when that route is OpenRouter. reader, when not nil, is the chosen model reading images
+// through its own client (chatGPTRoute).
 func newMediaRuntime(
 	cfg *config.Config, creds settings.Credentials, client *http.Client, primaryAcceptsImages bool,
+	reader multimodal.ImageReader,
 ) mediaRuntime {
 	visionCfg := multimodal.VisionConfigFrom(cfg, primaryAcceptsImages,
 		creds.PrimaryRouteKey(cfg.LLM.Provider, cfg.LLM.BaseURL))
 	visionCfg.HTTPClient = client
+	visionCfg.PrimaryReader = reader
 	sttCfg := multimodal.STTConfigFrom(cfg, creds.ServicesKey)
 	sttCfg.HTTPClient = client
 	return mediaRuntime{
@@ -78,7 +81,8 @@ func (r mediaRuntime) derive(
 		if err != nil {
 			return "", err
 		}
-		return assets.DescribeImageForRetrieval(ctx, r.vision, raw, mediaType(path, fileName, raw))
+		text, _, err := assets.DescribeImageForRetrieval(ctx, r.vision, raw, mediaType(path, fileName, raw))
+		return text, err
 	case mediaKindAudio:
 		// #nosec G304 -- this CLI intentionally reads the operator-selected document path.
 		raw, err := os.ReadFile(path)
@@ -120,7 +124,7 @@ func (r mediaRuntime) describeScannedPDF(ctx context.Context, path string) (stri
 		if readErr != nil {
 			return "", fmt.Errorf("read scanned PDF page %d: %w", i+1, readErr)
 		}
-		text, visionErr := assets.DescribeImageForRetrieval(ctx, r.vision, raw, "image/png")
+		text, _, visionErr := assets.DescribeImageForRetrieval(ctx, r.vision, raw, "image/png")
 		if visionErr != nil {
 			return "", fmt.Errorf("describe scanned PDF page %d: %w", i+1, visionErr)
 		}
@@ -240,6 +244,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer closeStore()
+	// Only images and scans are read by the chosen model: an audio file must not wait on the
+	// ChatGPT store, which a new ingest image under an old compose file does not have.
+	var reader multimodal.ImageReader
+	if mediaKind(*kind) == mediaKindImage || mediaKind(*kind) == mediaKindPDF {
+		if ctx, reader, err = chatGPTRoute(ctx, cfg, os.Getenv); err != nil {
+			_, _ = fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
 	acceptsImages := multimodal.PrimaryAcceptsImages(
 		ctx, llm.NewContentCapabilitySource(cfg.LLM, visionCapabilityTTL),
 	)
@@ -247,7 +260,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if fileName == "" {
 		fileName = filepath.Base(fs.Arg(0))
 	}
-	text, err := newMediaRuntime(cfg, creds, nil, acceptsImages).derive(ctx, mediaKind(*kind), fs.Arg(0), fileName)
+	text, err := newMediaRuntime(cfg, creds, nil, acceptsImages, reader).derive(ctx, mediaKind(*kind), fs.Arg(0), fileName)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		if errors.Is(err, multimodal.ErrNoVisionRoute) {

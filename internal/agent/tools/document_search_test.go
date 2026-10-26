@@ -143,6 +143,35 @@ func TestDocumentSearchSpecNamesCitationAndOpenContract(t *testing.T) {
 	}
 }
 
+// The agent knows which words are names; the description is how it learns that quoting one makes a
+// document carrying it rank first (spec 2026-10-25-document-exactness-and-judge, decision 1).
+func TestDocumentSearchSpecTellsTheAgentToQuoteVerbatimNames(t *testing.T) {
+	t.Parallel()
+	spec := (&DocumentSearch{}).Spec()
+	// Aura's two frictions on the lab VM (2026-10-25): an unquoted name's abstention read like a missing
+	// name's, and an exact-only document's score 0 read like irrelevance.
+	for _, want := range []string{
+		`Quote a name or a phrase that must appear verbatim`, `"Ubuntu Mono"`, "ranks first whatever its score",
+		"exact_terms lists what the search checked word for word", "quote it and search again",
+		"0 for a document that only an exact term admitted",
+	} {
+		if !strings.Contains(spec.Description, want) {
+			t.Errorf("description never says %q", want)
+		}
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Description string `json:"description"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(spec.Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(schema.Properties["query"].Description, "quote a name that must appear verbatim") {
+		t.Errorf("query = %q, want the quoting rule where the query is written", schema.Properties["query"].Description)
+	}
+}
+
 func toolTestContext(t *testing.T) context.Context {
 	t.Helper()
 	return WithToolCallContext(t.Context(), "session", "toolcall", t.TempDir(), 4096)

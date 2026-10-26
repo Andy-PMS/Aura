@@ -778,7 +778,7 @@ Amended 2026-10-23, measured on the lab VM with the chat on ChatGPT
 - **What the same run found.** A ChatGPT primary gives the media indexer no vision route: the
   capability source has no ChatGPT case. A scan then goes to the local OCR sidecar, which the
   VM does not run. The operator decided that the chosen model reads images whenever it can,
-  ChatGPT included; that is a slice of its own.
+  ChatGPT included. It landed on 2026-10-25: §11, "The chosen model reads images".
 
 A key counts as present only while the provider still holds it, not while Aura still has a
 row for it. Measured 2026-10-02 on the lab VM, reproducing an operator report: every key of
@@ -1381,9 +1381,9 @@ ArcadeDB schema, with version 1 URL queries (maximum 16 KiB), validated library 
 support exact uploaded-object lookup without inventing queue records. No Postgres migration
 or new environment setting is needed. These measurements establish SQL behavior on synthetic
 fixtures, not latency or memory bounds on a large archive, ingestion status, OCR fidelity or
-browser acceptance. Evidence: `docs/superpowers/verification/2026-10-21-paperless-documents.md`
-(final acceptance) and `.superpowers/sdd/2026-10-21-paperless-documents/task-1-report.md`
-(Task 1 measurements).
+browser acceptance. Evidence:
+`docs/superpowers/verification/2026-10-22-paperless-documents-acceptance.md` (final acceptance).
+The Task 1 measurements were written to the plan's git-ignored workspace, which was not kept.
 
 Measured 2026-10-21 on disposable ArcadeDB 26.10.1 databases: the Documents library's
 `file_type` filter accepts `all|documents|pdf|word|spreadsheet|presentation|text|image|video|audio|code`.
@@ -1429,6 +1429,22 @@ Word converts every page before previewing the first, spreadsheet fit-to-page is
 overview, and native font substitution remains visible. Evidence:
 `docs/superpowers/verification/2026-10-21-craft-document-previews.md`.
 
+The cockpit opens and edits a file in the Craft app for its kind (measured 2026-10-19/20; the
+versions moved on 2026-10-24). aura serves `AURA_APPS_DIR/<app>` (`/usr/share/aura/apps` in the
+image) at `/apps/<app>/` under its own page policy. GridCraft is its official release zip, checked
+by SHA-256. PdfCraft, WordCraft, DeckCraft, PhotoCraft and FilmCraft are built from their tags plus
+`docker/craft-web/<app>.patch` in `docker/aura-craft-web`, and the aura image copies a pinned build.
+One frame, `CraftFrame`, speaks the apps' `?host=parent` bridge. `<app>:save` stores the bytes in
+the library under the file's own name. While `<app>:dirty` is true the frame says the edit is
+unsaved, and the preview holds its first close. On the lab VM (build `5d12271d7`, 2026-10-20) the
+operator confirmed the pass in the cockpit. An edit reached its file, checked outside the app, for
+WordCraft and PhotoCraft by the operator's hand and for GridCraft and DeckCraft by a driven
+browser. At the 2026-10-24 versions each app again opened, edited and saved a real file through the
+bridge, in a dev container. These runs do not show PdfCraft or FilmCraft edits on the VM, WebGPU,
+Firefox, Safari or phones, memory use, or more than one small file per app. Evidence:
+`docs/superpowers/verification/2026-10-19-craft-web-apps.md`,
+`2026-10-24-craft-apps-upgrade.md`.
+
 Documents workspace amendment, recorded 2026-10-22 before Task 3 implementation:
 the live Paperless comparison and frontend inventory measured a folders-first entry,
 no document route, and a 17 px filename column at 390 px. The running content-search
@@ -1442,10 +1458,9 @@ File manager uploads return the stored absolute object ID; each queue item needs
 own uploads/UUID/ prefix, exact source-key polling with file_type=all, and identity-scoped
 storage/cancellation. Ingest counters measure components, not files. The measurements
 do not establish the new frontend's usability, refresh behavior or ingestion latency;
-those require Task 3 tests and controller-run live acceptance. Evidence and API inventory:
-`.superpowers/sdd/2026-10-21-paperless-documents/frontend-inventory.md`,
-`docs/superpowers/verification/2026-10-21-paperless-documents.md`, and
-`output/playwright/paperless-comparison/`.
+those require Task 3 tests and controller-run live acceptance. Evidence:
+`docs/superpowers/verification/2026-10-21-paperless-comparison.md`. The frontend inventory and
+the comparison screenshots were written to git-ignored folders and were not kept.
 
 Task 3 implementation inventory also confirms that library facets enumerate only type,
 counterparty and tag values. Custom-field Diff.set works for both explicit and filter-wide
@@ -1551,6 +1566,16 @@ This does not prove: a library beyond 8 documents, questions written by someone 
 the documents, short queries in general (one word scored high against a card), or exact phrases,
 which the cosine rerank can bury (0.199 for a font named verbatim in the DOCX). Record:
 `docs/superpowers/verification/2026-10-23-document-floors-pplx.md`.
+
+On the lab VM on v1.2.0 (2026-10-25), the agent's own check confirmed that "fattura" abstains,
+alone and with the tag `Cliente`. It also confirmed the fixes for the tools it had got wrong
+while writing the questions:
+- a listing with nothing to narrow it returns all 8 documents;
+- Office files open with their real media type;
+- `memory-aura` arrives whole.
+
+This proves abstention on those two queries only. Record:
+`docs/superpowers/verification/2026-10-25-document-tools-fixes-lab-vm.md`.
 
 **Upgrade note.** The release that ships the stamps finds every existing vector unstamped,
 so memory and documents answer lexically until they are re-embedded on the running route:
@@ -1677,6 +1702,45 @@ This does not prove:
   as a store's part number, was in no card or passage, so this rule could not find it. Since
   workbook rows became passages ("Workbook rows as passages", below), `RIC-10959` ranks first;
 - anything beyond 54 questions written by the corpus's own generator.
+
+**Exact terms admit and rank first (measured 2026-10-25).** This extends the rule above. An
+identifier is now one kind of exact term, beside a phrase the caller quotes (`"…"`, `“…”`, `«…»`)
+and a file name. A document that carries every exact term of the question is admitted whatever
+its cosine and ranks ahead of every other. Memory recall and the fact search follow the same
+rule. Nothing else is an exact term: no capitals, no sentence position, no word list.
+- **Where carriers come from.** Each full-text index is asked once, the terms' Lucene phrases OR-ed,
+  with no floor. Go then checks every text: ArcadeDB 26.10.2's phrase ignores word order
+  (`FullTextQueryExecutor.collectPhraseMatches`). A document only that query found is kept when
+  its title, its card without Aura's own notes, or its returned passages carry every term.
+- **What it does not score.** Such a document reports score 0; its exact evidence carries the
+  phrase's BM25, which is not the legs' scale.
+- **A failed lane is named** (`exact_terms_unavailable` in the documents, `exact_terms_failed` in
+  memory), and the documents never abstain on it.
+- **The response names what it checked word for word** (`exact_terms`, absent when nothing was).
+  Aura's agent, validating on the lab VM, could not tell an unquoted name's abstention from a
+  missing name's until it could read the list.
+
+Measured on the lab VM's library (8 documents, pplx-embed space, floors 0.39 and 0.72), on the 29
+questions of the 2026-10-23 floors set plus 11 for this rule:
+- s04 with "Ubuntu Mono" quoted, and the bare `"Ubuntu Mono"`, now return `calibre_demo.docx`
+  first. Unquoted, it still abstains.
+- The 5 out-of-corpus questions and "fattura" still abstain. The hard negatives admitted are 7 of
+  12, as before.
+- 16 identifiers cost what none do: medians of 904 and 901 ms per search.
+- Aura's agent quoted the name on its first call, unprompted.
+
+The record is [the verification](docs/superpowers/verification/2026-10-25-document-exact-terms-lab-vm.md).
+
+This does not prove:
+- **anything on the complex corpus.** `complex_qrels.json` was not run: no stack holds the complex
+  identity today;
+- **that an identifier extracted from a question never admits a non-answer.** `A4`, `Q3`, `24h`
+  and `COVID-19` are in no document of this library;
+- **a quoted name behind an elided article.** StandardAnalyzer keeps "l’italia" one token, so the
+  exact lane misses `"Italia è una Repubblica democratica"`; the legs still rank it first;
+- **the lane's candidate cap.** It reads each index up to 200 records in the documents and 400 per
+  kind in memory, and 8 documents never fill it;
+- anything about memory on the VM: memory was measured by the live tests alone.
 
 **The card's vector (measured 2026-10-16).** A card's vector is computed from its
 description: the card without what it says about Aura. That means no caveat, no cut notice, and
@@ -1887,6 +1951,31 @@ The primary model receives supported media natively where its route advertises t
 capability. OCR/transcription/extraction use shared services and settings. Telegram is
 an attachment wrapper, not a competing pipeline. Runs that need indexing wait for the
 relevant indexed state and show it to the user. Filename prose is not image transmission.
+
+**The chosen model reads images, ChatGPT included (measured 2026-10-25).** With the chat on the
+ChatGPT plan, the selected model reads the media indexer's images and scanned PDF pages and the
+daemon's upload summaries, each with the document owner's own ChatGPT account (spec
+`2026-10-25-media-vision-primary-design.md`).
+- **A reader, not the HTTP arm.** Measured on the lab VM: the plan's token gets 401
+  `rejected_by_access_enforcement` on `/v1/chat/completions` and reads the page on `/v1/responses`.
+  `(*chatgpt.Client).Describe` sends one Responses message, and the vision route asks it first.
+- **What falls back.** A model that reads no images, an owner with no connected account, a refusal
+  or a non-image type is "cannot read here": the sidecar takes the image, or the file is card-only.
+  Any other error is a failure that retries. It never hands the file to another model.
+- **The indexer opens the daemon's store** (`chatgptplan.Open`, which creates nothing), so
+  `aura-ingest` mounts `aura-home`.
+- **The daemon reads the route per image,** from `llm.Runtime`, so a model switched in the cockpit
+  reaches the upload summary without a restart. The indexer starts a process per file, so it
+  always did.
+- **Measured on the lab VM**
+  (`docs/superpowers/verification/2026-10-25-media-vision-primary-lab-vm.md`): a scan with no text
+  layer was indexed with its exact text and found by the agent; an image attached in chat was
+  summarised by `gpt-6.1-sol`. On `c034fb3c5`, the chat was switched from ChatGPT to Ollama and
+  back through the cockpit API, with no restart. Each attached screenshot was summarised by the
+  model in force (`gemma4:31b-cloud`, then `gpt-6.1-sol`), quoting its text, and `aura` kept its
+  start time.
+- **What it does not show:** a member's own account (the VM has one identity), Telegram
+  attachments, and the latency and plan cost per image.
 
 Video is indexed by metadata only, for now (operator, 2026-09-24): an `.mp4` or `.webm`,
 the two formats the asset layer calls video (`internal/assets/limits.go`), gets its card,
@@ -2122,6 +2211,24 @@ Record: `docs/superpowers/verification/2026-10-23-document-search-lists-lab-vm.m
 Tools and artifact delivery resolve the persistent working root consistently. Sandbox
 materialization and original-object access cannot expose another identity's files.
 Container paths, host staging and user-facing attachments are distinct.
+
+**The agent's tools run only in the per-identity box (since 2026-08-03, `0d76f84a8`; recorded
+2026-10-26).** `shell_exec`, the five `fs_*` tools, `send_file`, `skill_read` and `document_open`
+have no host arm. `buildSandboxRouter` builds the router on every profile, and a box that cannot
+be created makes the tool deny. Before, `document_open` wrote into the aura container's
+`/workspace` while `shell_exec` read the box's, and the agent found the file missing. The aura
+container keeps what Aura itself runs there:
+- poppler for `pdftotext` and `pdftoppm`;
+- git for pack fetches, and `postgresql-client` for backups;
+- Node/npm, uv and python3, for stdio MCP servers whose runtime is not the box (prepared with
+  uv or npm, amendment #211), for `npx skills add`, and for skill snippets.
+
+Measured on the lab VM on 2026-10-26: the image is 1.43 GB, Node 222 MB and uv 64 MB of it, and
+the container ran no process but `aura`. Only `serve`, `chat`, `shell`, `identity` and `mcp`
+build a router; the other CLI verbs need no Docker. Not shown: the live tabular acceptance the
+plan named (699 on `Clienti.xlsx`) was never recorded, and moving the remaining in-container
+installers into the box is not decided. Record:
+`docs/superpowers/verification/2026-10-26-one-path-sandbox-only.md`.
 
 **The boxes and the Aura container run on runc; gVisor retired 2026-10-11.** The operator
 retired gVisor: runc works well, and gVisor caused problems in the past. Until then two
@@ -3268,12 +3375,32 @@ their own implementation contract rather than being inferred from the generic AC
 
 Knowledge-work packs preserve repository membership across the upstream plugin
 manifest, skills, MCP declarations and commands. Resolve them from the repository,
-not a skill catalog that discarded their grouping. Connectors arrive blocked until
-one explicit pack trust decision covers the imported members; a pack cannot trust
-itself. Missing endpoints and unsupported entries are reported. Reuse the existing
-skill/MCP installers rather than creating a second marketplace or execution system.
-Composer discovery/invocation and governance management remain the intended UI
-contract; CLI installation alone is not evidence that every UI path is complete.
+not a skill catalog that discarded their grouping. Missing endpoints and unsupported
+entries are reported. Reuse the existing skill/MCP installers rather than creating a
+second marketplace or execution system.
+
+**The CLI install did not reach the running daemon** (measured on the lab VM,
+2026-10-23). `aura pack install` and `aura pack trust` wrote a correct row for
+`chetto1983/broker-analysis-mcp/broker-analysis`: runtime box, `initTimeoutSec` 120,
+trust `sandboxed_local`. The daemon never mounted it, because it mounts registry servers
+at boot and, while running, only through the cockpit's MCP write path (`MountNow`). The
+agent saw the skills and none of the tools.
+
+**What the operator decided** (2026-10-23 and 2026-10-25, spec
+`2026-10-25-pack-install-design.md`):
+- A plugin is installed by the operator, from Governance, or by the agent with the
+  operator's confirmation on an approval card. There is one daemon-side backend, and the
+  install mounts live.
+- The confirmation is the trust approval. It is recorded with the operator, the ref and
+  the reviewed commit; a pack still cannot trust itself.
+- Aura reads Agent Plugins 1.0 beside the Claude format, conformantly, with `PLUGIN_ROOT`
+  and `PLUGIN_DATA` in the identity's box. Install and remove are in scope; update is not.
+- A connector may not take a catalog recipe's name, and an installed skill never arrives
+  `always`-on.
+- The CLI keeps `aura pack list` and `aura pack show` only.
+
+**What this does not show:** one plugin and one identity measured, and no Agent Plugins
+plugin measured yet.
 
 ## 15. Scheduling, delegation and asynchronous delivery
 

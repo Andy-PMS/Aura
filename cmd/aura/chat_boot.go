@@ -489,9 +489,8 @@ func assembleChatEnv(
 		Profiles: onboarding.NewProfileStore(pool),
 		LLM:      cfg.LLM,
 		RunDir:   cfg.RunDir,
-		// Amendment #88: the per-turn "Working directory" hint mirrors the fixed
-		// WorkspaceRoot every host-direct tool now resolves against, replacing the
-		// process-cwd fallback (runner.New still falls back to os.Getwd if this is "").
+		// Amendment #88: the per-turn "Working directory" hint names the fixed working root,
+		// the box's /workspace (runner.New still falls back to os.Getwd if this is "").
 		Workspace:            cfg.WorkspaceDir,
 		PreviewCap:           cfg.ToolPreviewCap,
 		HistoryCap:           cfg.HistoryHardCapTurns,
@@ -504,7 +503,7 @@ func assembleChatEnv(
 		AlwaysBlock:              alwaysBlockProvider(cfg, newSharedSkillReader(cfg, pool)),
 		// The gateway resume hook records an operator's accept of a relayed gateway_approval
 		// pause into the SAME gateway instance (gw) the runner's PEP reads (D-03 point 2).
-		ResumeHook: chainResumeHooks(newShellResumeHook(toolHandles.ShellApprovals), newGatewayResumeHook(gw), newScheduledTaskResumeHook(taskStore)),
+		ResumeHook: chainResumeHooks(newShellResumeHook(toolHandles.ShellApprovals), newPluginResumeHook(toolHandles.Pack), newGatewayResumeHook(gw), newScheduledTaskResumeHook(taskStore)),
 		// The same gateway stamps a saved gateway pause with its challenge's target and
 		// withheld call id (spec 2026-10-12): the model relays neither.
 		ApprovalChallenges: gw.ApprovalChallengeDetails,

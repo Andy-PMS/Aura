@@ -14,15 +14,34 @@ import (
 	"github.com/chetto1983/aura/internal/skills"
 )
 
-// Fetcher materializes source into dir, which already exists and is empty.
-// It is the one seam that touches the network, so a test drives the whole
-// resolver against a fixture tree without one.
-type Fetcher func(ctx context.Context, source, dir string) error
+// Fetcher materializes source into dir, which already exists and is empty, at commit (the
+// default branch when empty), and returns the commit it landed on. It is the one seam that
+// touches the network, so a test drives the whole resolver against a fixture tree without one.
+type Fetcher func(ctx context.Context, source, dir, commit string) (string, error)
 
 // Resolver reads packs out of a repository.
 type Resolver struct {
-	// Fetch defaults to a shallow git clone (see fetch.go).
+	// Fetch defaults to GitFetcher{}.Fetch, a shallow git clone.
 	Fetch Fetcher
+	// WorkDir is where checkouts are made; empty means the system temp directory. The daemon
+	// passes its run dir: compose's /tmp is a 64 MiB tmpfs.
+	WorkDir string
+}
+
+// Checkout is a repository materialized at one commit, kept until Close. An install reads its
+// files after the review; Resolve, which only describes, closes it at once.
+type Checkout struct {
+	Root   string
+	Commit string
+	Packs  []Pack
+}
+
+// Close removes the checkout.
+func (c Checkout) Close() error {
+	if c.Root == "" {
+		return nil
+	}
+	return os.RemoveAll(c.Root)
 }
 
 // Resolve materializes the reference's repository once and returns its packs:
@@ -32,20 +51,51 @@ type Resolver struct {
 // empty slice — the caller asked to install something, and "nothing here" is an
 // answer they need rather than a quiet success with no packs in it.
 func (r *Resolver) Resolve(ctx context.Context, ref Ref) ([]Pack, error) {
+	c, err := r.Checkout(ctx, ref, "")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = c.Close() }()
+	return c.Packs, nil
+}
+
+// Checkout materializes the reference's repository at commit (the default branch when empty)
+// and reads its packs. A fetcher that lands on another commit than the one asked for is
+// refused: the install must read exactly what the operator reviewed.
+func (r *Resolver) Checkout(ctx context.Context, ref Ref, commit string) (Checkout, error) {
+	if commit != "" {
+		if err := ValidCommit(commit); err != nil {
+			return Checkout{}, err
+		}
+	}
 	fetch := r.Fetch
 	if fetch == nil {
-		fetch = GitFetcher
+		fetch = GitFetcher{}.Fetch
 	}
-	dir, err := os.MkdirTemp("", "aura-pack-*")
+	dir, err := os.MkdirTemp(r.WorkDir, "aura-pack-*")
 	if err != nil {
-		return nil, fmt.Errorf("pack workspace: %w", err)
+		return Checkout{}, fmt.Errorf("pack workspace: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(dir) }()
-
-	if err := fetch(ctx, ref.Source, dir); err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", ref.Source, err)
+	c := Checkout{Root: dir}
+	fail := func(err error) (Checkout, error) {
+		_ = c.Close()
+		return Checkout{}, err
 	}
-	return ReadTree(dir, ref)
+	resolved, err := fetch(ctx, ref.Source, dir, commit)
+	if err != nil {
+		return fail(fmt.Errorf("fetch %s: %w", ref.Source, err))
+	}
+	if err := ValidCommit(resolved); err != nil {
+		return fail(fmt.Errorf("fetch %s: %w", ref.Source, err))
+	}
+	if commit != "" && resolved != commit {
+		return fail(fmt.Errorf("fetch %s: landed on %s, asked for %s", ref.Source, resolved, commit))
+	}
+	if c.Packs, err = ReadTree(dir, ref); err != nil {
+		return fail(err)
+	}
+	c.Commit = resolved
+	return c, nil
 }
 
 // ReadTree resolves packs from an ALREADY-materialized repository at root. It is
@@ -66,7 +116,7 @@ func ReadTree(root string, ref Ref) ([]Pack, error) {
 		return nil, err
 	}
 	if len(dirs) == 0 {
-		return nil, fmt.Errorf("%s: no plugin manifest found (looked for .claude-plugin/plugin.json at the root and one level down)", ref.Source)
+		return nil, fmt.Errorf("%s: no plugin manifest found (looked for an Agent Plugins plugin.json and for .claude-plugin/plugin.json, at the root and one level down)", ref.Source)
 	}
 	packs := make([]Pack, 0, len(dirs))
 	for _, d := range dirs {
@@ -105,10 +155,15 @@ func packDirs(root string) ([]string, error) {
 }
 
 func hasManifest(root, dir string) bool {
+	if claimsAgentPlugins(filepath.Join(root, dir)) {
+		return true
+	}
 	info, err := os.Stat(filepath.Join(root, dir, ".claude-plugin", "plugin.json"))
 	return err == nil && !info.IsDir()
 }
 
+// readPack reads one plugin directory. A root plugin.json that declares an Agent Plugins
+// $schema wins over the Claude manifest beside it: §5.1 says no other file replaces it.
 func readPack(root, source, dir string) (Pack, error) {
 	if dir != "" {
 		if err := validSegment(dir); err != nil {
@@ -116,6 +171,9 @@ func readPack(root, source, dir string) (Pack, error) {
 		}
 	}
 	base := filepath.Join(root, dir)
+	if claimsAgentPlugins(base) {
+		return readAgentPack(base, source, dir)
+	}
 	man, err := readManifest(base)
 	if err != nil {
 		return Pack{}, fmt.Errorf("%s/%s: %w", source, dir, err)
@@ -127,6 +185,7 @@ func readPack(root, source, dir string) (Pack, error) {
 		Version:     man.Version,
 		Description: man.Description,
 		Author:      man.author(),
+		Format:      FormatClaude,
 	}
 	if pack.Name == "" {
 		// The manifest is what makes a directory a pack; one without a name
@@ -137,9 +196,11 @@ func readPack(root, source, dir string) (Pack, error) {
 	if pack.Skills, err = readSkillNames(base); err != nil {
 		return Pack{}, err
 	}
-	if pack.Servers, err = readServers(base); err != nil {
+	servers, err := readServers(base)
+	if err != nil {
 		return Pack{}, err
 	}
+	pack.Servers, pack.SkippedServers = splitConnectorNames(servers)
 	if pack.Commands, err = readCommands(base); err != nil {
 		return Pack{}, err
 	}
@@ -305,4 +366,19 @@ func readCommands(base string) ([]Command, error) {
 	}
 	sort.Slice(cmds, func(i, j int) bool { return cmds[i].Name < cmds[j].Name })
 	return cmds, nil
+}
+
+// splitConnectorNames sets aside every connector whose name Aura cannot carry as a registry
+// key and tool namespace, with the reason, rather than failing the whole pack over one entry.
+func splitConnectorNames(servers []Server) ([]Server, []Skipped) {
+	kept := servers[:0:0]
+	var skipped []Skipped
+	for _, s := range servers {
+		if err := ValidConnectorName(s.Name); err != nil {
+			skipped = append(skipped, Skipped{Name: s.Name, Reason: err.Error()})
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return kept, skipped
 }

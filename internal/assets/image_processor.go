@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/chetto1983/aura/internal/identityctx"
 	"github.com/chetto1983/aura/internal/multimodal"
 	"github.com/chetto1983/aura/internal/objectstore"
 )
@@ -18,21 +19,26 @@ const assetVisionPrompt = "Create plain retrieval text for indexing this user-su
 
 const assetVisionMaxRunes = 4096
 
-// ImageProcessor turns an uploaded image asset into a text summary. The OpenAI-
-// compatible vision call (local sidecar or OpenRouter cloud, with the one
-// config-only swap) and the VRAM-friendly downscale live in internal/multimodal;
-// this processor owns only the objectstore read and the Result mapping.
+// ImageDescriber reads one image and names the model that read it: *multimodal.VisionClient, or
+// the daemon's reader that builds one per image for the chat route in force.
+type ImageDescriber interface {
+	Describe(ctx context.Context, image []byte, mimeType, prompt string) (text, model string, err error)
+}
+
+// ImageProcessor turns an uploaded image asset into a text summary. The vision call and the
+// VRAM-friendly downscale live in internal/multimodal; this processor owns only the
+// objectstore read and the Result mapping.
 type ImageProcessor struct {
 	Objects objectstore.Store
-	Vision  *multimodal.VisionClient
+	Vision  ImageDescriber
 	// PerIdentityObjects, when set, resolves the ASSET OWNER's per-identity store so the
 	// object read targets the owner's bucket with the owner's creds. Nil → the shared Objects.
 	PerIdentityObjects *ObjectResolverBundle
 }
 
-// NewImageProcessor builds an image processor over the shared vision client.
-func NewImageProcessor(objects objectstore.Store, cfg multimodal.VisionConfig) *ImageProcessor {
-	return &ImageProcessor{Objects: objects, Vision: multimodal.NewVisionClient(cfg)}
+// NewImageProcessor builds an image processor that reads with vision.
+func NewImageProcessor(objects objectstore.Store, vision ImageDescriber) *ImageProcessor {
+	return &ImageProcessor{Objects: objects, Vision: vision}
 }
 
 func (p *ImageProcessor) ProcessAsset(ctx context.Context, asset Asset) (Result, error) {
@@ -57,7 +63,9 @@ func (p *ImageProcessor) ProcessAsset(ctx context.Context, asset Asset) (Result,
 	if mimeType == "" {
 		mimeType = attrs.MIMEType
 	}
-	summary, err := DescribeImageForRetrieval(ctx, p.Vision, imageBytes, mimeType)
+	// The owner's identity, as for the object: a ChatGPT route reads with the owner's account.
+	summary, model, err := DescribeImageForRetrieval(
+		identityctx.WithIdentityID(ctx, asset.IdentityID), p.Vision, imageBytes, mimeType)
 	if err != nil {
 		return Result{}, err
 	}
@@ -65,18 +73,18 @@ func (p *ImageProcessor) ProcessAsset(ctx context.Context, asset Asset) (Result,
 		Status:  StatusComplete,
 		Summary: summary,
 		Metadata: map[string]any{
-			"vision_model": p.Vision.VisionModel(),
+			"vision_model": model,
 		},
 	}, nil
 }
 
 // DescribeImageForRetrieval is the shared image-to-text boundary for immediate asset
-// summaries and durable Garage indexing.
+// summaries and durable Garage indexing. model names the model that read the image.
 func DescribeImageForRetrieval(
-	ctx context.Context, vision *multimodal.VisionClient, imageBytes []byte, mimeType string,
-) (string, error) {
+	ctx context.Context, vision ImageDescriber, imageBytes []byte, mimeType string,
+) (text, model string, err error) {
 	if vision == nil {
-		return "", fmt.Errorf("vision client is not configured")
+		return "", "", fmt.Errorf("vision client is not configured")
 	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
@@ -85,11 +93,11 @@ func DescribeImageForRetrieval(
 	if prepared, err := multimodal.DownscaleForVision(ctx, imageBytes, 0); err == nil && prepared.MIMEType != "" {
 		imageBytes, mimeType = prepared.Bytes, prepared.MIMEType
 	}
-	summary, err := vision.Describe(ctx, imageBytes, mimeType, assetVisionPrompt)
+	summary, model, err := vision.Describe(ctx, imageBytes, mimeType, assetVisionPrompt)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return capVisionRetrievalText(summary), nil
+	return capVisionRetrievalText(summary), model, nil
 }
 
 func capVisionRetrievalText(text string) string {

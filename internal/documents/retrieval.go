@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ import (
 // be read back tomorrow against the cascade that actually produced it. Bump it whenever the
 // leg set, the admission thresholds or the ranking change — old citations then stay legible
 // as products of the older profile instead of silently claiming the new one.
-const ProductionRetrievalProfile = "arcadedb-fused-card-v3"
+const ProductionRetrievalProfile = "arcadedb-fused-card-v4"
 
 // The three sentinels separate blame. An empty query is the caller's input, an invalid scope
 // means a named document is not visible to this identity, and an invalid request means the
@@ -37,7 +38,8 @@ type RetrievalStatus string
 // The status names how the legs answered; the degradation reason names the dependency that
 // kept them off the full path. They travel together because an answer read lexically for want
 // of an embedding and one narrowed to cards by an offline ArcadeDB need different operator
-// responses.
+// responses. DegradationExactTerms alone may come with a complete status: the legs ran whole,
+// and only the exact lane was lost.
 const (
 	RetrievalComplete RetrievalStatus = "complete"
 	RetrievalCardOnly RetrievalStatus = "degraded_card_only"
@@ -56,6 +58,10 @@ const (
 	// (spec §3). DegradationSpaceCheck: the gate that decides it could not be read.
 	DegradationSpaceMismatch = "embedding_space_mismatch"
 	DegradationSpaceCheck    = "embedding_space_check_failed"
+	// DegradationExactTerms: the exact lane could not run. The legs' answer stands without the
+	// carriers their floors kept out, so an empty answer does not abstain. It joins the legs'
+	// own reason with "+" (arcadedb.JoinReasons), whatever the status.
+	DegradationExactTerms = "exact_terms_unavailable"
 
 	// AbstainedNoQualifiedPassage is the healthy cascade reporting that the corpus has
 	// nothing to say. It is NOT a degradation: every leg ran, and the dense floor let
@@ -101,6 +107,11 @@ type RetrievalResponse struct {
 	// as though the library had agreed. It mirrors memory_search's own contract.
 	Abstained        bool   `json:"abstained"`
 	AbstentionReason string `json:"abstention_reason,omitempty"`
+	// ExactTerms are the quoted phrases, identifiers and file names the search checked word for
+	// word (spec 2026-10-25-document-exactness-and-judge, decision 1). Absent, it looked for no
+	// name verbatim. Measured on the lab VM on 2026-10-25, Aura could not tell an abstention for
+	// "Ubuntu Mono" unquoted from one for a name the library lacks.
+	ExactTerms []string `json:"exact_terms,omitempty"`
 
 	// Indexing is how far the ingest reconciler has got, so a caller that has just added
 	// a document can tell "not indexed yet" from "indexed and has nothing to say" -- the
@@ -246,6 +257,8 @@ type PassageIndex interface {
 	FusedCandidates(context.Context, arcadedb.FusedCandidateQuery) ([]arcadedb.PassageCandidate, error)
 	// LexicalCandidates ranks passages by the full-text index alone, for lexical mode.
 	LexicalCandidates(context.Context, arcadedb.CandidateFilter, string) ([]arcadedb.PassageCandidate, error)
+	// ExactTermDocuments finds the passages and cards that carry any of the exact terms, with no floor.
+	ExactTermDocuments(context.Context, arcadedb.CandidateFilter, []arcadedb.ExactTerm) (arcadedb.ExactTermHits, error)
 	PassagesAt(context.Context, string, []arcadedb.PassageRef) ([]arcadedb.PassageCandidate, error)
 	// IngestState answers "has the reconciler caught up", from the row the sidecar
 	// upserts beside the passages. nil means it has never written one.
@@ -331,25 +344,38 @@ func (r *HostRetriever) Retrieve(ctx context.Context, request RetrievalRequest) 
 	if err != nil {
 		return RetrievalResponse{}, fmt.Errorf("documents: route document cards: %w", err)
 	}
+	terms := arcadedb.QueryExactTerms(request.Query)
+	for _, term := range terms {
+		response.ExactTerms = append(response.ExactTerms, term.Raw)
+	}
 	if r.PassageIndex == nil {
 		response.Status, response.DegradationReason = RetrievalCardOnly, DegradationUnconfigured
 		r.degradations.warn(DegradationUnconfigured, "no passage index is wired", request.IdentityID)
-		response.Documents = rankCardsOnly(cards, arcadedb.QueryIdentifiers(request.Query), request.Limit, cfg.TopPassages)
+		response.Documents = rankCardsOnly(cards, terms, request.Limit, cfg.TopPassages)
 		return response, nil
 	}
 	response.Indexing = r.ingestState(ctx, request.IdentityID)
 	sourceKeys, sourcePrefixes := ArcadeSourceFilters(request.SourceScopes)
-	fused, err := r.passages(ctx, arcadedb.CandidateFilter{
+	filter := arcadedb.CandidateFilter{
 		IdentityID: request.IdentityID, Limit: cfg.CandidateLimit, DocumentIDs: scope,
 		SourceKeys: sourceKeys, SourcePrefixes: sourcePrefixes, Fields: request.Fields,
-	}, request.Query, dense, cfg.FusionStrategy)
+	}
+	fused, err := r.passages(ctx, filter, request.Query, dense, cfg.FusionStrategy)
 	if err != nil {
 		response.Status, response.DegradationReason = RetrievalCardOnly, DegradationArcade
 		r.degradations.warn(DegradationArcade, err.Error(), request.IdentityID)
-		response.Documents = rankCardsOnly(cards, arcadedb.QueryIdentifiers(request.Query), request.Limit, cfg.TopPassages)
+		response.Documents = rankCardsOnly(cards, terms, request.Limit, cfg.TopPassages)
 		return response, nil
 	}
-	// Abstain when NEITHER leg qualified, not when the passage leg alone came back empty.
+	exact := r.exactTermLane(ctx, filter, terms)
+	if exact.failed {
+		response.DegradationReason = arcadedb.JoinReasons(response.DegradationReason, DegradationExactTerms)
+	}
+	names := r.passageLegNames(ctx, request.IdentityID, slices.Concat(cards, exact.cards), slices.Concat(fused, exact.passages))
+	response.Documents = rankDocuments(cards, fused, exact, names, request.Limit, cfg.TopPassages)
+	// Abstain when nothing qualified: neither leg, nor a document carrying the question's exact
+	// terms. Not when the passage leg alone came back empty, and not when the exact lane failed:
+	// without it nothing says the library holds no carrier.
 	//
 	// The rule used to be "no passage, no answer", written when a card was ranked by BM25
 	// and a passage by a cosine, so a card could not be weighed against anything and
@@ -365,21 +391,13 @@ func (r *HostRetriever) Retrieve(ctx context.Context, request RetrievalRequest) 
 	// ISTAT" abstained outright while gi_comuni_cap.xlsx sat in the card leg -- and the
 	// same question asked with a place name in it did return the file, because unrelated
 	// weather documents happened to qualify and carried the cards along with them.
-	if len(fused) == 0 {
-		if len(cards) == 0 {
-			response.Abstained, response.AbstentionReason = true, AbstainedNoQualifiedPassage
-			return response, nil
-		}
-		// No passage was retrieved, so nothing here can be quoted: every answer must be
-		// opened. That is rankCardsOnly's contract, and it is not a degradation -- both
-		// legs ran and one of them found something.
-		response.Documents = rankCardsOnly(cards, arcadedb.QueryIdentifiers(request.Query), request.Limit, cfg.TopPassages)
+	//
+	// A document with no passage in the answer cannot be quoted, so rankDocuments marks it
+	// requires_open. That is not a degradation: the legs ran and one of them found it.
+	if len(response.Documents) == 0 && !exact.failed {
+		response.Abstained, response.AbstentionReason = true, AbstainedNoQualifiedPassage
 		return response, nil
 	}
-	response.Documents = rankDocuments(
-		cards, fused, r.passageLegNames(ctx, request.IdentityID, cards, fused),
-		arcadedb.QueryIdentifiers(request.Query), request.Limit, cfg.TopPassages, false,
-	)
 	r.attachNeighbours(ctx, request.IdentityID, response.Documents, request.Neighbours)
 	return response, nil
 }

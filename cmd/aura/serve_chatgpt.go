@@ -4,25 +4,35 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"path/filepath"
 	"slices"
 
 	"github.com/chetto1983/aura/internal/chatgptplan"
 	"github.com/chetto1983/aura/internal/config"
 	"github.com/chetto1983/aura/internal/llm"
 	"github.com/chetto1983/aura/internal/llm/chatgpt"
+	"github.com/chetto1983/aura/internal/multimodal"
 )
 
 func newChatGPTPlan(cfg *config.Config) *chatgptplan.Service {
 	if cfg == nil || cfg.AuthulaSecret == "" || cfg.SkillsDir == "" {
 		return nil
 	}
-	service, err := chatgptplan.New(filepath.Dir(cfg.SkillsDir), cfg.AuthulaSecret)
+	service, err := chatgptplan.New(cfg.ChatGPTPlanRoot(), cfg.AuthulaSecret)
 	if err != nil {
 		slog.Warn("ChatGPT connection unavailable")
 		return nil
 	}
 	return service
+}
+
+// chatGPTImageReader is the route's model reading upload images with each owner's account, or
+// nil off ChatGPT or without the connection service. The nil is untyped, so the vision client
+// keeps its HTTP arms.
+func chatGPTImageReader(cfg llm.Config, plan *chatgptplan.Service) multimodal.ImageReader {
+	if cfg.Provider != llm.ChatGPTProvider || plan == nil {
+		return nil
+	}
+	return chatgpt.New(cfg, plan)
 }
 
 func chatGPTTokenSourceOrNil(service *chatgptplan.Service) chatGPTTokenSource {

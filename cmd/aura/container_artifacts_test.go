@@ -265,9 +265,9 @@ func TestProductionContainerArtifactsMatchFatImageContract(t *testing.T) {
 	}
 
 	// Nothing in the image may warm a uv cache for a recipe to consume at runtime. compose
-	// mounts a named volume over /root/.cache/uv for the host-direct shell_exec path, and a
-	// named volume is seeded ONCE at creation and never refreshed — so a warm-up here is
-	// invisible to every image built after that volume existed. The calculator recipe was
+	// mounts a named volume over /root/.cache/uv for the installers that run in the aura
+	// container, and a named volume is seeded ONCE at creation and never refreshed — so a
+	// warm-up here is invisible to every image built after that volume existed. The calculator recipe was
 	// built on exactly that assumption and is retired; this keeps the shape out.
 	// Only the image side is checkable as text here; the recipe side is asserted against the
 	// real catalog data in manager.TestNoRecipeDependsOnABuildTimeUVCache, which a comment
@@ -463,6 +463,22 @@ func TestIngestSupervisorUsesExistingIdentityGarageBindings(t *testing.T) {
 	dockerfile := readProjectFile(t, root, filepath.Join("docker", "aura-ingest", "Dockerfile"))
 	if !strings.Contains(dockerfile, `ENTRYPOINT ["aura-ingest-supervisor"]`) {
 		t.Fatalf("ingest image does not start the identity supervisor:\n%s", dockerfile)
+	}
+}
+
+// The media indexer opens the daemon's ChatGPT credentials store, so aura-ingest mounts
+// aura-home where the daemon does and derives the same store path from AURA_SKILLS_DIR. A
+// volume subpath would need Docker Engine 26, and no install checks the engine.
+func TestIngestOpensTheDaemonsChatGPTStore(t *testing.T) {
+	root := repoRootForTest(t)
+	service := composeServiceBlock(t, readProjectFile(t, root, "compose.yaml"), "aura-ingest")
+	for _, want := range []string{"- aura-home:/var/lib/aura", "AURA_SKILLS_DIR: /var/lib/aura/skills"} {
+		if !strings.Contains(service, want) {
+			t.Fatalf("aura-ingest missing %q:\n%s", want, service)
+		}
+	}
+	if strings.Contains(service, "subpath:") {
+		t.Fatalf("aura-ingest mounts a volume subpath:\n%s", service)
 	}
 }
 
